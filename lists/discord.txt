@@ -1,0 +1,28 @@
+# Discord — домены для обхода (основа: Flowseal/zapret-discord-youtube, lists/list-general.txt).
+# Одна строка — один домен, поддомены учитываются автоматически.
+# Префикс ^ — только этот домен, без поддоменов.
+dis.gd
+discord.app
+discord.co
+discord.com
+discord.design
+discord.dev
+discord.gift
+discord.gifts
+discord.gg
+discord.media
+discord.new
+discord.store
+discord.status
+discord-activities.com
+discordactivities.com
+discordapp.com
+discordapp.net
+discordcdn.com
+discordmerch.com
+discordpartygames.com
+discordsays.com
+discordsez.com
+discordstatus.com
+discord-attachments-uploads-prd.storage.googleapis.com
+stable.dl2.discordapp.net

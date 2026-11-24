@@ -1,0 +1,13 @@
+# Стратегии tpws для macOS (только TCP). Формат: номер|название|параметры tpws для HTTPS (порт 443).
+# На macOS --oob и --disorder вместе НЕ работают (см. bol-van/zapret docs/readme.md).
+# Порядок — от самых популярных у пользователей macOS к редким.
+1|oob-tlsrec-midsld|--tlsrec=midsld --split-pos=1 --oob
+2|oob-split1|--split-pos=1 --oob
+3|disorder-split1-midsld|--split-pos=1,midsld --disorder
+4|oob-tlsrec-sniext1|--tlsrec=sniext+1 --split-pos=1 --oob
+5|disorder-tlsrec-midsld|--tlsrec=midsld --split-pos=1 --disorder
+6|oob-split1-midsld|--split-pos=1,midsld --oob
+7|tlsrec-midsld|--tlsrec=midsld --split-pos=1
+8|disorder-midsld|--split-pos=midsld --disorder
+9|split1-midsld|--split-pos=1,midsld
+10|oob-midsld|--split-pos=midsld --oob

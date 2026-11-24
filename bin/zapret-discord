@@ -1,0 +1,458 @@
+#!/bin/bash
+# zapret-discord — управление обходом DPI для Discord и YouTube на macOS.
+# Движок: tpws из bol-van/zapret (SOCKS-режим) + системный PAC (только нужные домены идут через tpws).
+# Совместимо с /bin/bash 3.2 (штатный bash в macOS).
+
+set -u
+
+ZD_HOME="/usr/local/zapret-discord"
+ZD_LABEL="io.github.levks787-star.zapret-discord"
+ZD_CONFIG="$ZD_HOME/config"
+ZD_STATE="$ZD_HOME/state"
+ZD_RUN="$ZD_HOME/run"
+ZD_LISTS="$ZD_HOME/lists"
+ZD_LOGDIR="/Library/Logs/zapret-discord"
+PF_ANCHOR="com.apple/zapret-discord"
+PF_TOKEN_FILE="/var/run/zapret-discord.pftoken"
+LD_DIR="/Library/LaunchDaemons"
+
+# значения по умолчанию (переопределяются файлом config)
+ENABLED=0
+STRATEGY=1
+QUIC_BLOCK=1
+SOCKS_PORT=10987
+PAC_PORT=10988
+# shellcheck disable=SC1090
+[ -r "$ZD_CONFIG" ] && . "$ZD_CONFIG"
+
+PAC_URL="http://127.0.0.1:${PAC_PORT}/proxy.pac"
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  \342\234\205 %s\n' "$*"; }   # ✅
+bad()  { printf '  \342\235\214 %s\n' "$*"; }   # ❌
+warn() { printf '  \342\232\240\357\270\217  %s\n' "$*"; }  # ⚠️
+die()  { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+
+need_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		say "Нужны права администратора — macOS спросит пароль от вашей учётной записи (символы не отображаются)."
+		exec sudo "$0" "$@"
+	fi
+}
+
+set_conf() { # key value
+	local tmp
+	tmp="$(mktemp "$ZD_HOME/.config.XXXXXX")" || die "не могу записать config"
+	if [ -f "$ZD_CONFIG" ]; then
+		grep -v "^$1=" "$ZD_CONFIG" > "$tmp" || true
+	fi
+	printf '%s=%s\n' "$1" "$2" >> "$tmp"
+	chmod 644 "$tmp"
+	mv -f "$tmp" "$ZD_CONFIG"
+	eval "$1=\"\$2\""
+}
+
+# ---------- стратегии ----------
+strategy_line() { grep -E "^$1\|" "$ZD_LISTS/strategies.txt" 2>/dev/null | head -n 1; }
+strategy_name() { strategy_line "$1" | cut -d'|' -f2; }
+strategy_args() { strategy_line "$1" | cut -d'|' -f3-; }
+strategy_ids()  { grep -E '^[0-9]+\|' "$ZD_LISTS/strategies.txt" | cut -d'|' -f1; }
+
+# ---------- списки и PAC ----------
+build_lists() {
+	mkdir -p "$ZD_RUN"
+	cat "$ZD_LISTS/discord.txt" "$ZD_LISTS/youtube.txt" "$ZD_LISTS/user.txt" 2>/dev/null \
+		| sed -e 's/#.*$//' -e 's/[[:space:]]//g' | tr '[:upper:]' '[:lower:]' | grep -E '^\^?[a-z0-9._-]+$' \
+		| awk '!seen[$0]++' > "$ZD_RUN/hosts.txt.new"
+	mv -f "$ZD_RUN/hosts.txt.new" "$ZD_RUN/hosts.txt"
+
+	local proxy="SOCKS5 127.0.0.1:${SOCKS_PORT}; SOCKS 127.0.0.1:${SOCKS_PORT}; DIRECT"
+	{
+		printf '// Сгенерировано zapret-discord. Не редактируйте — правьте %s/user.txt\n' "$ZD_LISTS"
+		printf 'var P = "%s";\n' "$proxy"
+		printf 'var D = ['
+		grep -v '^\^' "$ZD_RUN/hosts.txt" | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}'
+		printf '];\nvar E = ['
+		grep '^\^' "$ZD_RUN/hosts.txt" | sed 's/^\^//' | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}'
+		printf '];\n'
+		cat <<'PAC'
+function FindProxyForURL(url, host) {
+  host = host.toLowerCase();
+  var i;
+  for (i = 0; i < E.length; i++) { if (host == E[i]) return P; }
+  for (i = 0; i < D.length; i++) {
+    if (host == D[i] || dnsDomainIs(host, "." + D[i])) return P;
+  }
+  return "DIRECT";
+}
+PAC
+	} > "$ZD_RUN/proxy.pac.new"
+	mv -f "$ZD_RUN/proxy.pac.new" "$ZD_RUN/proxy.pac"
+	chmod 644 "$ZD_RUN/hosts.txt" "$ZD_RUN/proxy.pac"
+}
+
+# ---------- launchd ----------
+ld_loaded() { launchctl print "system/$ZD_LABEL.$1" >/dev/null 2>&1; }
+ld_start() {
+	local plist="$LD_DIR/$ZD_LABEL.$1.plist"
+	[ -f "$plist" ] || die "нет $plist — переустановите"
+	launchctl enable "system/$ZD_LABEL.$1" 2>/dev/null || true
+	if ! ld_loaded "$1"; then
+		launchctl bootstrap system "$plist" 2>/dev/null || launchctl load -w "$plist" 2>/dev/null || true
+	fi
+}
+ld_stop() {
+	if ld_loaded "$1"; then
+		launchctl bootout "system/$ZD_LABEL.$1" 2>/dev/null || launchctl unload "$LD_DIR/$ZD_LABEL.$1.plist" 2>/dev/null || true
+	fi
+	launchctl disable "system/$ZD_LABEL.$1" 2>/dev/null || true
+}
+tpws_restart() { launchctl kickstart -k "system/$ZD_LABEL.tpws" >/dev/null 2>&1 || { ld_stop tpws; ld_start tpws; }; }
+tpws_running() { pgrep -f "$ZD_HOME/bin/tpws" >/dev/null 2>&1; }
+
+wait_socks() {
+	local i=0
+	while [ $i -lt 20 ]; do
+		nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1 && return 0
+		sleep 0.5; i=$((i + 1))
+	done
+	return 1
+}
+
+# ---------- системный прокси (PAC) ----------
+list_services() {
+	networksetup -listallnetworkservices 2>/dev/null | sed '1d' | sed 's/^\*//'
+}
+proxy_backup_has() { [ -f "$ZD_STATE/proxy-backup.tsv" ] && cut -f1 "$ZD_STATE/proxy-backup.tsv" | grep -Fxq "$1"; }
+
+proxy_apply() {
+	mkdir -p "$ZD_STATE"
+	touch "$ZD_STATE/proxy-backup.tsv"
+	local svc out url en
+	list_services | while IFS= read -r svc; do
+		[ -n "$svc" ] || continue
+		out="$(networksetup -getautoproxyurl "$svc" </dev/null 2>/dev/null)" || continue
+		url="$(printf '%s\n' "$out" | sed -n 's/^URL: //p')"
+		en="$(printf '%s\n' "$out" | sed -n 's/^Enabled: //p')"
+		if [ "$url" = "$PAC_URL" ] && [ "$en" = "Yes" ]; then
+			continue
+		fi
+		if ! proxy_backup_has "$svc"; then
+			[ "$url" = "$PAC_URL" ] && url="(null)" && en="No"
+			printf '%s\t%s\t%s\n' "$svc" "${en:-No}" "${url:-(null)}" >> "$ZD_STATE/proxy-backup.tsv"
+		fi
+		networksetup -setautoproxyurl "$svc" "$PAC_URL" </dev/null 2>/dev/null &&
+			networksetup -setautoproxystate "$svc" on </dev/null 2>/dev/null
+	done
+}
+
+proxy_restore() {
+	local svc en url cur
+	if [ -f "$ZD_STATE/proxy-backup.tsv" ]; then
+		while IFS="$(printf '\t')" read -r svc en url; do
+			[ -n "$svc" ] || continue
+			if [ "$en" = "Yes" ] && [ -n "$url" ] && [ "$url" != "(null)" ]; then
+				networksetup -setautoproxyurl "$svc" "$url" </dev/null 2>/dev/null
+				networksetup -setautoproxystate "$svc" on </dev/null 2>/dev/null
+			else
+				[ -n "$url" ] && [ "$url" != "(null)" ] && networksetup -setautoproxyurl "$svc" "$url" </dev/null 2>/dev/null
+				networksetup -setautoproxystate "$svc" off </dev/null 2>/dev/null
+			fi
+		done < "$ZD_STATE/proxy-backup.tsv"
+		rm -f "$ZD_STATE/proxy-backup.tsv"
+	fi
+	# подстраховка: если где-то остался наш PAC — выключить
+	list_services | while IFS= read -r svc; do
+		[ -n "$svc" ] || continue
+		cur="$(networksetup -getautoproxyurl "$svc" </dev/null 2>/dev/null | sed -n 's/^URL: //p')"
+		[ "$cur" = "$PAC_URL" ] && networksetup -setautoproxystate "$svc" off </dev/null 2>/dev/null
+	done
+	return 0
+}
+
+proxy_count_ours() {
+	list_services | while IFS= read -r svc; do
+		[ -n "$svc" ] || continue
+		out="$(networksetup -getautoproxyurl "$svc" </dev/null 2>/dev/null)"
+		printf '%s\n' "$out" | grep -qx "URL: $PAC_URL" && printf '%s\n' "$out" | grep -qx 'Enabled: Yes' && echo x
+	done | wc -l | tr -d ' '
+}
+
+# ---------- блок QUIC (UDP 443) через pf-якорь внутри com.apple/* ----------
+# /etc/pf.conf не меняем: штатный pf.conf macOS уже вызывает anchor "com.apple/*".
+# pf включаем через `pfctl -E` (счётчик ссылок с токеном) и отпускаем `pfctl -X <токен>`,
+# поэтому если pf был выключен до нас — он снова выключится.
+quic_rules_loaded() { pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q 'port = 443'; }
+quic_apply() {
+	printf 'block return out quick proto udp from any to any port 443\n' > "$ZD_RUN/pf-quic.conf"
+	pfctl -q -a "$PF_ANCHOR" -f "$ZD_RUN/pf-quic.conf" 2>/dev/null || return 1
+	if [ ! -s "$PF_TOKEN_FILE" ]; then
+		local tok
+		tok="$(pfctl -E 2>&1 | sed -n 's/.*[Tt]oken *: *\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+		[ -n "$tok" ] && printf '%s\n' "$tok" > "$PF_TOKEN_FILE"
+	fi
+	return 0
+}
+quic_remove() {
+	pfctl -q -a "$PF_ANCHOR" -F all 2>/dev/null || true
+	if [ -s "$PF_TOKEN_FILE" ]; then
+		pfctl -q -X "$(cat "$PF_TOKEN_FILE")" 2>/dev/null || true
+		rm -f "$PF_TOKEN_FILE"
+	fi
+	rm -f "$ZD_RUN/pf-quic.conf"
+	return 0
+}
+
+flush_dns() { dscacheutil -flushcache 2>/dev/null; killall -HUP mDNSResponder 2>/dev/null; return 0; }
+
+# ---------- проверки ----------
+CHECK_URLS="https://discord.com/api/v9/gateway
+https://gateway.discord.gg/
+https://cdn.discordapp.com/
+https://media.discordapp.net/
+https://www.youtube.com/
+https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg
+https://redirector.googlevideo.com/report_mapping"
+# короткий набор для автоподбора (чтобы перебор шёл быстро)
+AUTO_URLS="https://discord.com/api/v9/gateway
+https://gateway.discord.gg/
+https://www.youtube.com/
+https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+
+probe() { # url [socks]  -> печатает http-код (000 = не дошли)
+	if [ "${2:-}" = socks ]; then
+		curl -sS -o /dev/null -m 6 --connect-timeout 4 -w '%{http_code}' --socks5-hostname "127.0.0.1:$SOCKS_PORT" "$1" 2>/dev/null
+	else
+		curl -sS -o /dev/null -m 6 --connect-timeout 4 -w '%{http_code}' --noproxy '*' "$1" 2>/dev/null
+	fi
+}
+
+score_socks() { # [urls] -> число успешных URL через tpws
+	local n=0 u code
+	for u in ${1:-$CHECK_URLS}; do
+		code="$(probe "$u" socks)"
+		[ -n "$code" ] && [ "$code" != "000" ] && n=$((n + 1))
+	done
+	printf '%s' "$n"
+}
+
+cmd_check() {
+	local u d s total=0 good=0
+	say "Проверка zapret-discord (стратегия $STRATEGY: $(strategy_name "$STRATEGY"))"
+	say ""
+	if [ "$ENABLED" = 1 ]; then ok "Включено в настройках"; else bad "Выключено (zapret-discord on)"; fi
+	if tpws_running; then ok "tpws запущен"; else bad "tpws не запущен"; fi
+	if nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then ok "SOCKS 127.0.0.1:$SOCKS_PORT отвечает"; else bad "SOCKS 127.0.0.1:$SOCKS_PORT не отвечает"; fi
+	if curl -fsS -m 3 --noproxy '*' "$PAC_URL" 2>/dev/null | grep -q FindProxyForURL; then ok "PAC отдаётся: $PAC_URL"; else bad "PAC не отдаётся: $PAC_URL"; fi
+	local n; n="$(proxy_count_ours)"
+	if [ "$n" -gt 0 ]; then ok "Системный автопрокси (PAC) включён на сетевых службах: $n"; else bad "Системный автопрокси не включён"; fi
+	if [ "$QUIC_BLOCK" = 1 ]; then
+		if quic_rules_loaded 2>/dev/null; then ok "QUIC (UDP 443) заблокирован — видео пойдёт по TCP"; else warn "Блок QUIC не загружен (без sudo не видно) — если YouTube тормозит, отключите QUIC в браузере"; fi
+	else
+		say "  ·  Блок QUIC выключен (zapret-discord quic on)"
+	fi
+	say ""
+	say "  Сайт                                         напрямую   через zapret"
+	for u in $CHECK_URLS; do
+		d="$(probe "$u")"; s="$(probe "$u" socks)"
+		total=$((total + 1)); [ "$s" != "000" ] && [ -n "$s" ] && good=$((good + 1))
+		printf '  %-44s %-10s %s\n' "$(printf '%s' "$u" | sed 's|https://||' | cut -c1-44)" \
+			"$( [ "$d" = 000 ] && echo 'нет' || echo "ok ($d)")" "$( [ "$s" = 000 ] && echo 'нет' || echo "ok ($s)")"
+	done
+	say ""
+	if [ "$good" -eq "$total" ]; then
+		say "Итог: всё открывается через zapret. Перезапустите Discord и браузер (Cmd+Q), если ещё не."
+	elif [ "$good" -gt 0 ]; then
+		say "Итог: открывается $good из $total. Попробуйте подобрать стратегию: zapret-discord auto"
+	else
+		say "Итог: через zapret ничего не открылось. Попробуйте: zapret-discord auto. Если не поможет — у провайдера блок по IP, нужен VPN."
+	fi
+	say "Голос Discord (UDP) так не проверить и на macOS этот инструмент его НЕ обходит — см. README."
+}
+
+# ---------- команды ----------
+cmd_on() {
+	need_root on "$@"
+	[ -x "$ZD_HOME/bin/tpws" ] || die "не найден $ZD_HOME/bin/tpws — переустановите"
+	strategy_line "$STRATEGY" >/dev/null && [ -n "$(strategy_line "$STRATEGY")" ] || set_conf STRATEGY 1
+	set_conf ENABLED 1
+	build_lists
+	ld_start pac
+	ld_start tpws
+	ld_start ensure
+	tpws_restart
+	wait_socks || warn "tpws не поднялся на 127.0.0.1:$SOCKS_PORT — смотрите: zapret-discord log"
+	proxy_apply
+	if [ "$QUIC_BLOCK" = 1 ]; then quic_apply || warn "не удалось включить блок QUIC через pf (не критично)"; fi
+	flush_dns
+	say "Включено. Стратегия $STRATEGY: $(strategy_name "$STRATEGY")."
+	say "Полностью закройте Discord и браузер (Cmd+Q) и откройте снова."
+}
+
+cmd_off() {
+	need_root off "$@"
+	set_conf ENABLED 0
+	proxy_restore
+	quic_remove
+	ld_stop tpws
+	ld_stop pac
+	flush_dns
+	say "Выключено. Настройки прокси возвращены как были. Перезапустите Discord и браузер."
+}
+
+cmd_restart() {
+	need_root restart "$@"
+	build_lists
+	if [ "$ENABLED" = 1 ]; then cmd_on; else say "Сейчас выключено — включите: zapret-discord on"; fi
+}
+
+cmd_status() {
+	if [ "${1:-}" = "--short" ]; then
+		if [ "$ENABLED" = 1 ] && tpws_running; then printf 'включён (стратегия %s: %s)\n' "$STRATEGY" "$(strategy_name "$STRATEGY")"
+		elif [ "$ENABLED" = 1 ]; then printf 'включён, но tpws не запущен\n'
+		else printf 'выключен\n'; fi
+		return 0
+	fi
+	say "zapret-discord $(cat "$ZD_HOME/VERSION" 2>/dev/null || echo '?')"
+	say "  Состояние:  $(cmd_status --short)"
+	say "  Стратегия:  $STRATEGY — $(strategy_name "$STRATEGY")  [$(strategy_args "$STRATEGY")]"
+	say "  Блок QUIC:  $( [ "$QUIC_BLOCK" = 1 ] && echo вкл || echo выкл)"
+	say "  SOCKS:      127.0.0.1:$SOCKS_PORT   PAC: $PAC_URL"
+	say "  tpws:       $(cat "$ZD_HOME/ZAPRET_VERSION" 2>/dev/null || echo '?') (bol-van/zapret)"
+}
+
+cmd_strategy() {
+	local sub="${1:-list}"
+	case "$sub" in
+		list|"")
+			say "Стратегии (текущая отмечена *):"
+			grep -E '^[0-9]+\|' "$ZD_LISTS/strategies.txt" | while IFS='|' read -r id name args; do
+				if [ "$id" = "$STRATEGY" ]; then m='*'; else m=' '; fi
+				printf ' %s %2s  %-24s %s\n' "$m" "$id" "$name" "$args"
+			done
+			say ""
+			say "Сменить: zapret-discord strategy <номер>    Подобрать автоматически: zapret-discord auto"
+			;;
+		next)
+			local ids first="" found="" nxt=""
+			ids="$(strategy_ids)"
+			for i in $ids; do
+				[ -z "$first" ] && first="$i"
+				if [ -n "$found" ] && [ -z "$nxt" ]; then nxt="$i"; fi
+				[ "$i" = "$STRATEGY" ] && found=1
+			done
+			cmd_strategy "${nxt:-$first}"
+			;;
+		*)
+			case "$sub" in *[!0-9]*) die "номер стратегии — число. Список: zapret-discord strategy list" ;; esac
+			[ -n "$(strategy_line "$sub")" ] || die "нет стратегии $sub. Список: zapret-discord strategy list"
+			need_root strategy "$sub"
+			set_conf STRATEGY "$sub"
+			if [ "$ENABLED" = 1 ]; then tpws_restart; wait_socks || true; fi
+			say "Стратегия $sub: $(strategy_name "$sub"). Перезапустите Discord/браузер и проверьте."
+			;;
+	esac
+}
+
+cmd_auto() {
+	need_root auto "$@"
+	[ "$ENABLED" = 1 ] || cmd_on >/dev/null
+	local total best_id="" best=-1 sc sc2 id
+	total="$(printf '%s\n' "$AUTO_URLS" | wc -l | tr -d ' ')"
+	if [ "${1:-}" = "--if-needed" ]; then
+		wait_socks || true
+		sc="$(score_socks "$AUTO_URLS")"
+		if [ "$sc" -eq "$total" ]; then
+			say "Текущая стратегия $STRATEGY ($(strategy_name "$STRATEGY")) работает: $sc/$total."
+			return 0
+		fi
+		say "Текущая стратегия даёт $sc/$total — подбираю другую…"
+	fi
+	say "Перебираю стратегии (это займёт до пары минут)…"
+	for id in $(strategy_ids); do
+		set_conf STRATEGY "$id"
+		tpws_restart
+		wait_socks || { say "  $id: tpws не запустился"; continue; }
+		sc="$(score_socks "$AUTO_URLS")"
+		if [ "$sc" -eq "$total" ]; then
+			# повторная проверка: некоторые стратегии (особенно --oob) работают через раз
+			sc2="$(score_socks "$AUTO_URLS")"
+			[ "$sc2" -lt "$sc" ] && sc="$sc2"
+		fi
+		printf '  %2s  %-24s %s/%s\n' "$id" "$(strategy_name "$id")" "$sc" "$total"
+		if [ "$sc" -gt "$best" ]; then best="$sc"; best_id="$id"; fi
+		[ "$sc" -eq "$total" ] && break
+	done
+	[ -n "$best_id" ] || best_id=1
+	set_conf STRATEGY "$best_id"
+	tpws_restart; wait_socks || true
+	say ""
+	if [ "$best" -le 0 ]; then
+		say "Ни одна стратегия не помогла. Скорее всего провайдер режет по IP — нужен VPN. Оставил стратегию $best_id."
+	else
+		say "Выбрана стратегия $best_id ($(strategy_name "$best_id")): $best/$total. Перезапустите Discord и браузер."
+	fi
+}
+
+cmd_quic() {
+	case "${1:-}" in
+		on)  need_root quic on;  set_conf QUIC_BLOCK 1; [ "$ENABLED" = 1 ] && quic_apply; say "Блок QUIC включён." ;;
+		off) need_root quic off; set_conf QUIC_BLOCK 0; quic_remove; say "Блок QUIC выключен." ;;
+		*)   say "Использование: zapret-discord quic on|off  (сейчас: $( [ "$QUIC_BLOCK" = 1 ] && echo on || echo off))" ;;
+	esac
+}
+
+# Вызывается launchd при загрузке и каждые 5 минут: дочинить то, что могло слететь
+# (новая сетевая служба, перезагрузка pf, упавший tpws).
+cmd_ensure() {
+	[ "$(id -u)" -eq 0 ] || exit 0
+	[ "$ENABLED" = 1 ] || exit 0
+	[ -f "$ZD_RUN/proxy.pac" ] || build_lists
+	ld_loaded pac  || ld_start pac
+	ld_loaded tpws || ld_start tpws
+	tpws_running || tpws_restart
+	proxy_apply
+	if [ "$QUIC_BLOCK" = 1 ]; then
+		if ! quic_rules_loaded || [ ! -s "$PF_TOKEN_FILE" ]; then quic_apply || true; fi
+	fi
+	exit 0
+}
+
+cmd_log() { tail -n "${1:-50}" "$ZD_LOGDIR/tpws.log" 2>/dev/null || say "Журнал пуст: $ZD_LOGDIR/tpws.log"; }
+
+cmd_help() {
+	cat <<HELP
+zapret-discord — обход блокировок Discord и YouTube на macOS (tpws из bol-van/zapret)
+
+  zapret-discord on              включить (и автозапуск после перезагрузки)
+  zapret-discord off             выключить (вернуть прокси как было)
+  zapret-discord status          что сейчас включено
+  zapret-discord check           проверить, открываются ли Discord и YouTube
+  zapret-discord auto            подобрать рабочую стратегию автоматически
+  zapret-discord strategy        список стратегий
+  zapret-discord strategy <N>    выбрать стратегию N (или: strategy next)
+  zapret-discord quic on|off     блокировать QUIC (UDP 443), чтобы YouTube шёл через обход
+  zapret-discord restart         перечитать списки доменов ($ZD_LISTS/user.txt)
+  zapret-discord log             последние строки журнала tpws
+  zapret-discord uninstall       удалить всё
+
+Голос Discord (UDP) этот инструмент на macOS НЕ обходит — см. README.
+HELP
+}
+
+case "${1:-help}" in
+	on|start|вкл)        shift; cmd_on "$@" ;;
+	off|stop|выкл)       shift; cmd_off "$@" ;;
+	restart)             shift; cmd_restart "$@" ;;
+	status)              shift; cmd_status "$@" ;;
+	check)               shift; cmd_check "$@" ;;
+	strategy|s)          shift; cmd_strategy "$@" ;;
+	auto)                shift; cmd_auto "$@" ;;
+	quic)                shift; cmd_quic "$@" ;;
+	log)                 shift; cmd_log "$@" ;;
+	_ensure)             cmd_ensure ;;
+	uninstall)           need_root uninstall; exec /bin/bash "$ZD_HOME/uninstall.sh" --yes ;;
+	version|-v|--version) cat "$ZD_HOME/VERSION" 2>/dev/null ;;
+	help|-h|--help)      cmd_help ;;
+	*)                   cmd_help; exit 1 ;;
+esac
