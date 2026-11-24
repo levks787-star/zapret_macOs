@@ -1,8 +1,8 @@
 #!/bin/bash
 # zapret-discord-macos — установщик.
-#   curl -fsSL https://raw.githubusercontent.com/levks787-star/zapret-discord-macos/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/levks787-star/zapret_macOs/main/install.sh | bash
 # или
-#   git clone https://github.com/levks787-star/zapret-discord-macos.git && cd zapret-discord-macos && ./install.sh
+#   git clone https://github.com/levks787-star/zapret_macOs.git && cd zapret_macOs && ./install.sh
 #
 # Запускайте от обычного пользователя, БЕЗ sudo — пароль спросится сам.
 # Совместимо с /bin/bash 3.2 (штатный в macOS).
@@ -13,7 +13,7 @@ set -euo pipefail
 main() {
 
 REPO_OWNER="levks787-star"
-REPO_NAME="zapret-discord-macos"
+REPO_NAME="zapret_macOs"
 REPO_TARBALL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/main.tar.gz"
 
 # Официальный релиз bol-van/zapret (зафиксирован и проверяется по SHA-256).

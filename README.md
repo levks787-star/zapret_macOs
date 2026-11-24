@@ -32,7 +32,7 @@
 2. Вставьте строку и нажмите Enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/levks787-star/zapret-discord-macos/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/levks787-star/zapret_macOs/main/install.sh | bash
 ```
 
 3. Когда попросит **Password** — введите пароль от своей учётной записи Mac (буквы при вводе не видны — так и надо) и нажмите Enter.
@@ -44,13 +44,13 @@ curl -fsSL https://raw.githubusercontent.com/levks787-star/zapret-discord-macos/
 Вариант через git:
 
 ```bash
-git clone https://github.com/levks787-star/zapret-discord-macos.git && cd zapret-discord-macos && ./install.sh
+git clone https://github.com/levks787-star/zapret_macOs.git && cd zapret_macOs && ./install.sh
 ```
 
 Если скачали ZIP через Safari, сначала снимите «карантин» Gatekeeper, иначе macOS может не дать запустить скрипты:
 
 ```bash
-cd ~/Downloads/zapret-discord-macos-main && xattr -cr . && ./install.sh
+cd ~/Downloads/zapret_macOs-main && xattr -cr . && ./install.sh
 ```
 
 ### Параметры установщика
